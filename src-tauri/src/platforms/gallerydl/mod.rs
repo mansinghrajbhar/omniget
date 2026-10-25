@@ -14,32 +14,11 @@ use omniget_core::models::progress::ProgressUpdate;
 use omniget_core::platforms::traits::PlatformDownloader;
 
 const GALLERY_HOSTS: &[&str] = &[
-    "deviantart.com",
-    "pixiv.net",
-    "artstation.com",
-    "flickr.com",
-    "tumblr.com",
-    "danbooru.donmai.us",
-    "gelbooru.com",
-    "e621.net",
-    "rule34.xxx",
-    "konachan.com",
-    "yande.re",
-    "newgrounds.com",
-    "kemono.su",
-    "kemono.party",
-    "coomer.su",
-    "fanbox.cc",
-    "weibo.com",
-    "boards.4chan.org",
-    "boards.4channel.org",
-    "imgur.com",
-    "imgchest.com",
-    "nhentai.net",
-    "hentai-foundry.com",
-    "baraag.net",
-    "wallhaven.cc",
-    "subscribestar.adult",
+    "deviantart.com", "pixiv.net", "artstation.com", "flickr.com", "tumblr.com",
+    "danbooru.donmai.us", "gelbooru.com", "e621.net", "rule34.xxx", "konachan.com",
+    "yande.re", "newgrounds.com", "kemono.su", "kemono.party", "coomer.su", "fanbox.cc",
+    "weibo.com", "boards.4chan.org", "boards.4channel.org", "imgur.com", "imgchest.com",
+    "nhentai.net", "hentai-foundry.com", "baraag.net", "wallhaven.cc", "subscribestar.adult",
 ];
 
 pub fn is_gallery_url(url: &str) -> bool {
@@ -49,33 +28,27 @@ pub fn is_gallery_url(url: &str) -> bool {
             .map(|h| h.trim_start_matches("www.").to_lowercase()),
         Err(_) => None,
     };
-    let Some(host) = host else {
-        return false;
-    };
+    let Some(host) = host else { return false; };
     GALLERY_HOSTS
         .iter()
         .any(|h| host == *h || host.ends_with(&format!(".{}", h)))
 }
 
-/// Twitter path segments that are app routes, not usernames.
+/// Twitter/X path segments that are app routes, not usernames.
 const TWITTER_RESERVED: &[&str] = &[
-    "home", "explore", "notifications", "messages", "settings", "search",
-    "hashtag", "intent", "share", "login", "logout", "signup", "i", "about",
-    "tos", "privacy", "compose", "jobs",
+    "home", "explore", "notifications", "messages", "settings", "search", "hashtag",
+    "intent", "share", "login", "logout", "signup", "i", "about", "tos", "privacy",
+    "compose", "jobs",
 ];
 
-/// Bulk-listing URLs (profiles, subreddits) that the single-post platform
-/// downloaders can't handle but gallery-dl can enumerate and download.
+/// Bulk-listing URLs that gallery-dl can enumerate. Single posts are deliberately
+/// left to OmniGet's normal platform downloaders.
 pub fn is_bulk_media_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
+    let Ok(parsed) = url::Url::parse(url) else { return false; };
     let Some(host) = parsed
         .host_str()
         .map(|h| h.trim_start_matches("www.").to_lowercase())
-    else {
-        return false;
-    };
+    else { return false; };
     let segments: Vec<&str> = parsed
         .path_segments()
         .map(|s| s.filter(|p| !p.is_empty()).collect())
@@ -83,10 +56,8 @@ pub fn is_bulk_media_url(url: &str) -> bool {
 
     if host == "reddit.com" || host.ends_with(".reddit.com") {
         return match segments.as_slice() {
-            // subreddit root or its listing sorts, but never a post
             ["r", _] => true,
             ["r", _, sort] => matches!(*sort, "hot" | "new" | "top" | "rising" | "best"),
-            // user profile / submitted media
             ["user" | "u", _] => true,
             ["user" | "u", _, tail] => matches!(*tail, "submitted" | "posts"),
             _ => false,
@@ -103,50 +74,62 @@ pub fn is_bulk_media_url(url: &str) -> bool {
         };
     }
 
+    // gallery-dl supports Instagram user profiles and collections. A one-segment
+    // path is treated as a profile; /p, /reel and /tv are single-content routes.
+    if host == "instagram.com" || host.ends_with(".instagram.com") {
+        return match segments.as_slice() {
+            [user] => !matches!(*user, "accounts" | "direct" | "explore" | "reels" | "stories"),
+            _ => false,
+        };
+    }
+
+    // TikTok profile URLs use /@username. Video URLs contain /video/<id> and
+    // therefore remain handled by the normal TikTok downloader.
+    if host == "tiktok.com" || host.ends_with(".tiktok.com") {
+        return match segments.as_slice() {
+            [user] if user.starts_with('@') => true,
+            _ => false,
+        };
+    }
+
+    // gallery-dl supports Facebook user profiles/pages, photos and videos. Keep
+    // only simple profile/page paths here so individual post/video URLs are not
+    // intercepted by the bulk extractor.
+    if host == "facebook.com" || host.ends_with(".facebook.com") {
+        return match segments.as_slice() {
+            [user] => !matches!(*user, "watch" | "reel" | "reels" | "photo.php" | "video.php" | "share"),
+            _ => false,
+        };
+    }
+
     false
 }
 
 pub struct GalleryDlDownloader;
 
 impl GalleryDlDownloader {
-    pub fn new() -> Self {
-        Self
-    }
+    pub fn new() -> Self { Self }
 }
 
 impl Default for GalleryDlDownloader {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 fn title_from_url(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
-        let host = parsed
-            .host_str()
-            .unwrap_or("gallery")
-            .trim_start_matches("www.")
-            .to_string();
+        let host = parsed.host_str().unwrap_or("gallery").trim_start_matches("www.").to_string();
         let last = parsed
             .path_segments()
             .and_then(|s| s.filter(|p| !p.is_empty()).last())
             .unwrap_or("")
             .to_string();
-        if last.is_empty() {
-            host
-        } else {
-            format!("{} - {}", host, last)
-        }
-    } else {
-        "gallery".to_string()
-    }
+        if last.is_empty() { host } else { format!("{} - {}", host, last) }
+    } else { "gallery".to_string() }
 }
 
 #[async_trait]
 impl PlatformDownloader for GalleryDlDownloader {
-    fn name(&self) -> &str {
-        "gallery"
-    }
+    fn name(&self) -> &str { "gallery" }
 
     fn can_handle(&self, url: &str) -> bool {
         is_gallery_url(url) || is_bulk_media_url(url)
@@ -186,11 +169,7 @@ impl PlatformDownloader for GalleryDlDownloader {
 
         let bin = omniget_core::core::dependencies::ensure_gallerydl()
             .await
-            .ok_or_else(|| {
-                anyhow!(
-                    "gallery-dl is not available. Install gallery-dl to download from this site."
-                )
-            })?;
+            .ok_or_else(|| anyhow!("gallery-dl is not available. Install gallery-dl to download from this site."))?;
 
         std::fs::create_dir_all(&opts.output_dir)?;
         let _ = progress.send(ProgressUpdate::percent(-2.0)).await;
@@ -205,34 +184,20 @@ impl PlatformDownloader for GalleryDlDownloader {
         if let Some(data_dir) = omniget_core::core::paths::app_data_dir() {
             let archive_dir = data_dir.join("archive");
             if std::fs::create_dir_all(&archive_dir).is_ok() {
-                cmd.arg("--download-archive")
-                    .arg(archive_dir.join("gallery-dl.txt"));
+                cmd.arg("--download-archive").arg(archive_dir.join("gallery-dl.txt"));
             }
             let cookie_file = data_dir.join("chrome-extension-cookies.txt");
-            if std::fs::metadata(&cookie_file)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-            {
+            if std::fs::metadata(&cookie_file).map(|m| m.len() > 0).unwrap_or(false) {
                 cmd.arg("--cookies").arg(&cookie_file);
             }
         }
 
         cmd.arg("--").arg(&url);
-
         cmd.kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow!("Failed to start gallery-dl: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to start gallery-dl: {}", e))?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("No stdout from gallery-dl"))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("No stderr from gallery-dl"))?;
-
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("No stdout from gallery-dl"))?;
+        let stderr_pipe = child.stderr.take().ok_or_else(|| anyhow!("No stderr from gallery-dl"))?;
         let started_at = SystemTime::now();
 
         let progress_tx = progress.clone();
@@ -242,9 +207,7 @@ impl PlatformDownloader for GalleryDlDownloader {
             let mut last_emit = std::time::Instant::now();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
-                    continue;
-                }
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') { continue; }
                 count += 1;
                 if last_emit.elapsed() >= std::time::Duration::from_millis(250) {
                     let pct = ((count as f64 / (count as f64 + 4.0)) * 100.0).min(95.0);
@@ -284,10 +247,7 @@ impl PlatformDownloader for GalleryDlDownloader {
                 .rev()
                 .find(|l| {
                     let l = l.to_lowercase();
-                    l.contains("error")
-                        || l.contains("forbidden")
-                        || l.contains("not found")
-                        || l.contains("unsupported")
+                    l.contains("error") || l.contains("forbidden") || l.contains("not found") || l.contains("unsupported")
                 })
                 .unwrap_or("gallery-dl failed")
                 .trim()
@@ -297,13 +257,10 @@ impl PlatformDownloader for GalleryDlDownloader {
 
         let (file_path, total_bytes) = collect_new_files(&opts.output_dir, started_at);
         if total_bytes == 0 {
-            return Err(anyhow!(
-                "gallery-dl completed but downloaded no new files (already archived or empty gallery)"
-            ));
+            return Err(anyhow!("gallery-dl completed but downloaded no new files (already archived or empty gallery)"));
         }
 
         let _ = progress.send(ProgressUpdate::percent(100.0)).await;
-
         Ok(DownloadResult {
             file_path,
             file_size_bytes: total_bytes,
@@ -322,16 +279,10 @@ fn collect_new_files(dir: &Path, since: SystemTime) -> (PathBuf, u64) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
+            let Ok(meta) = entry.metadata() else { continue; };
+            if !meta.is_file() { continue; }
             let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if modified < since {
-                continue;
-            }
+            if modified < since { continue; }
             total += meta.len();
             new_count += 1;
             single = Some(path.clone());
@@ -341,11 +292,7 @@ fn collect_new_files(dir: &Path, since: SystemTime) -> (PathBuf, u64) {
         }
     }
 
-    let file_path = if new_count == 1 {
-        single.unwrap_or_else(|| dir.to_path_buf())
-    } else {
-        dir.to_path_buf()
-    };
+    let file_path = if new_count == 1 { single.unwrap_or_else(|| dir.to_path_buf()) } else { dir.to_path_buf() };
     (file_path, total)
 }
 
@@ -355,9 +302,7 @@ mod tests {
 
     #[test]
     fn matches_curated_gallery_hosts() {
-        assert!(is_gallery_url(
-            "https://www.deviantart.com/someartist/gallery"
-        ));
+        assert!(is_gallery_url("https://www.deviantart.com/someartist/gallery"));
         assert!(is_gallery_url("https://www.pixiv.net/en/users/12345"));
         assert!(is_gallery_url("https://danbooru.donmai.us/posts?tags=foo"));
         assert!(is_gallery_url("https://imgur.com/a/abcd"));
@@ -373,25 +318,30 @@ mod tests {
     }
 
     #[test]
-    fn bulk_matches_subreddits_and_profiles() {
+    fn bulk_matches_social_profiles() {
         assert!(is_bulk_media_url("https://www.reddit.com/r/pics"));
         assert!(is_bulk_media_url("https://www.reddit.com/r/pics/top"));
         assert!(is_bulk_media_url("https://reddit.com/user/spez"));
         assert!(is_bulk_media_url("https://www.reddit.com/u/spez/submitted"));
         assert!(is_bulk_media_url("https://twitter.com/nasa"));
         assert!(is_bulk_media_url("https://x.com/nasa/media"));
+        assert!(is_bulk_media_url("https://www.instagram.com/nasa/"));
+        assert!(is_bulk_media_url("https://www.tiktok.com/@nasa"));
+        assert!(is_bulk_media_url("https://www.facebook.com/nasa"));
     }
 
     #[test]
     fn bulk_ignores_single_posts_and_app_routes() {
-        assert!(!is_bulk_media_url(
-            "https://www.reddit.com/r/pics/comments/abc123/title/"
-        ));
+        assert!(!is_bulk_media_url("https://www.reddit.com/r/pics/comments/abc123/title/"));
         assert!(!is_bulk_media_url("https://v.redd.it/abc"));
         assert!(!is_bulk_media_url("https://x.com/nasa/status/123456"));
         assert!(!is_bulk_media_url("https://x.com/home"));
         assert!(!is_bulk_media_url("https://twitter.com/i/web/status/1"));
         assert!(!is_bulk_media_url("https://x.com/search?q=foo"));
         assert!(!is_bulk_media_url("https://www.reddit.com/"));
+        assert!(!is_bulk_media_url("https://www.instagram.com/p/abc123/"));
+        assert!(!is_bulk_media_url("https://www.instagram.com/reel/abc123/"));
+        assert!(!is_bulk_media_url("https://www.tiktok.com/@nasa/video/123456"));
+        assert!(!is_bulk_media_url("https://www.facebook.com/watch/?v=123456"));
     }
 }
