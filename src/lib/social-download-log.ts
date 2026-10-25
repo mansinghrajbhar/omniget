@@ -8,10 +8,19 @@ export type SocialFailure = {
 
 export const SOCIAL_FAILURE_LOG_KEY = 'omniget.social.failures.v1';
 
+// Vitest runs in a Node environment without browser localStorage. Keep a small
+// in-memory fallback so the same persistence API is testable outside the app.
+let memoryFailures: SocialFailure[] = [];
+
+function storage(): Storage | null {
+  return typeof localStorage === 'undefined' ? null : localStorage;
+}
+
 export function readSocialFailures(): SocialFailure[] {
-  if (typeof localStorage === 'undefined') return [];
+  const store = storage();
+  if (!store) return [...memoryFailures];
   try {
-    const value = JSON.parse(localStorage.getItem(SOCIAL_FAILURE_LOG_KEY) || '[]');
+    const value = JSON.parse(store.getItem(SOCIAL_FAILURE_LOG_KEY) || '[]');
     return Array.isArray(value) ? value : [];
   } catch {
     return [];
@@ -20,12 +29,16 @@ export function readSocialFailures(): SocialFailure[] {
 
 export function recordSocialFailure(entry: SocialFailure): SocialFailure[] {
   const next = [entry, ...readSocialFailures()].slice(0, 500);
-  if (typeof localStorage !== 'undefined') localStorage.setItem(SOCIAL_FAILURE_LOG_KEY, JSON.stringify(next));
+  const store = storage();
+  if (store) store.setItem(SOCIAL_FAILURE_LOG_KEY, JSON.stringify(next));
+  else memoryFailures = next;
   return next;
 }
 
 export function clearSocialFailures(): void {
-  if (typeof localStorage !== 'undefined') localStorage.removeItem(SOCIAL_FAILURE_LOG_KEY);
+  const store = storage();
+  if (store) store.removeItem(SOCIAL_FAILURE_LOG_KEY);
+  memoryFailures = [];
 }
 
 export function socialFailureSummary(entries: SocialFailure[]): { total: number; byPlatform: Record<string, number> } {
