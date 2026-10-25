@@ -2,8 +2,8 @@ import { describe, it, expect } from "vitest";
 import { CORE_NAV_ITEMS } from "./nav-config";
 
 describe("CORE_NAV_ITEMS", () => {
-  it("has the expected 5 core entries", () => {
-    expect(CORE_NAV_ITEMS).toHaveLength(5);
+  it("has the expected 6 core entries", () => {
+    expect(CORE_NAV_ITEMS).toHaveLength(6);
   });
 
   it("Home is first in primary group", () => {
@@ -15,6 +15,12 @@ describe("CORE_NAV_ITEMS", () => {
   it("Downloads carries the downloads badge", () => {
     const downloads = CORE_NAV_ITEMS.find((i) => i.href === "/downloads");
     expect(downloads?.badge).toBe("downloads");
+  });
+
+  it("Social Downloader is in the primary group", () => {
+    const social = CORE_NAV_ITEMS.find((i) => i.href === "/social");
+    expect(social?.group).toBe("primary");
+    expect(social?.order).toBe(25);
   });
 
   it("About is in the app group after settings", () => {
