@@ -8,17 +8,17 @@ export type SocialFailure = {
 
 export const SOCIAL_FAILURE_LOG_KEY = 'omniget.social.failures.v1';
 
-// Vitest runs in a Node environment without browser localStorage. Keep a small
-// in-memory fallback so the same persistence API is testable outside the app.
+// Keep an in-memory mirror so the persistence API also behaves consistently in
+// Vitest/SSR environments where browser localStorage may be absent or mocked.
 let memoryFailures: SocialFailure[] = [];
 
 function storage(): Storage | null {
   return typeof localStorage === 'undefined' ? null : localStorage;
 }
 
-export function readSocialFailures(): SocialFailure[] {
+function loadStoredFailures(): SocialFailure[] {
   const store = storage();
-  if (!store) return [...memoryFailures];
+  if (!store) return [];
   try {
     const value = JSON.parse(store.getItem(SOCIAL_FAILURE_LOG_KEY) || '[]');
     return Array.isArray(value) ? value : [];
@@ -27,18 +27,39 @@ export function readSocialFailures(): SocialFailure[] {
   }
 }
 
+export function readSocialFailures(): SocialFailure[] {
+  if (memoryFailures.length === 0) {
+    memoryFailures = loadStoredFailures().slice(0, 500);
+  }
+  return [...memoryFailures];
+}
+
 export function recordSocialFailure(entry: SocialFailure): SocialFailure[] {
   const next = [entry, ...readSocialFailures()].slice(0, 500);
+  memoryFailures = next;
+
   const store = storage();
-  if (store) store.setItem(SOCIAL_FAILURE_LOG_KEY, JSON.stringify(next));
-  else memoryFailures = next;
-  return next;
+  if (store) {
+    try {
+      store.setItem(SOCIAL_FAILURE_LOG_KEY, JSON.stringify(next));
+    } catch {
+      // localStorage may be unavailable/quota-limited; memory remains usable.
+    }
+  }
+
+  return [...next];
 }
 
 export function clearSocialFailures(): void {
-  const store = storage();
-  if (store) store.removeItem(SOCIAL_FAILURE_LOG_KEY);
   memoryFailures = [];
+  const store = storage();
+  if (store) {
+    try {
+      store.removeItem(SOCIAL_FAILURE_LOG_KEY);
+    } catch {
+      // Ignore storage failures; the in-memory log is already cleared.
+    }
+  }
 }
 
 export function socialFailureSummary(entries: SocialFailure[]): { total: number; byPlatform: Record<string, number> } {
