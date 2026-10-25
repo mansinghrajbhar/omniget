@@ -4,6 +4,7 @@
   import { getDownloads } from '$lib/stores/download-store.svelte';
   import { getSettings } from '$lib/stores/settings-store.svelte';
   import { showToast } from '$lib/stores/toast-store.svelte';
+  import { dedupeSocialUrls, normalizeSocialUrl, validateSocialDateRange, withSocialRetry } from '$lib/social-downloader';
 
   type Platform = 'Instagram' | 'Facebook' | 'Twitter / X' | 'Reddit' | 'TikTok';
   type Mode = 'Single post' | 'Bulk / profile' | 'Multiple URLs';
@@ -12,6 +13,7 @@
 
   const platforms: Platform[] = ['Instagram', 'Facebook', 'Twitter / X', 'Reddit', 'TikTok'];
   const modes: Mode[] = ['Single post', 'Bulk / profile', 'Multiple URLs'];
+  const HISTORY_KEY = 'omniget.social.history.v1';
 
   let platform = $state<Platform>('Instagram');
   let mode = $state<Mode>('Single post');
@@ -35,179 +37,39 @@
   let currentItem = $state('');
   let completedThisRun = $state(0);
   let failedThisRun = $state(0);
+  let duplicateThisRun = $state(0);
+  let importedThisRun = $state(0);
   let downloads = $derived(getDownloads());
 
-  const platformClass = (name: Platform) => name.toLowerCase().replace(/[^a-z]/g, '-');
-
-  function localDate(daysAgo: number): string {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - daysAgo);
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  }
-
-  function setDatePreset(days: number | null) {
-    if (days === null) { fromDate = ''; toDate = ''; return; }
-    fromDate = localDate(days); toDate = localDate(0);
-  }
-
-  function getInputUrls(): string[] {
-    return url.split(/\s+/).map((value) => value.trim()).filter(Boolean);
-  }
-
-  function matchesPlatform(target: string): boolean {
-    try {
-      const host = new URL(target).hostname.toLowerCase().replace(/^www\./, '');
-      const domains: Record<Platform, string[]> = {
-        Instagram: ['instagram.com'], Facebook: ['facebook.com', 'fb.watch'],
-        'Twitter / X': ['x.com', 'twitter.com'], Reddit: ['reddit.com', 'redd.it'], TikTok: ['tiktok.com'],
-      };
-      return domains[platform].some((domain) => host === domain || host.endsWith(`.${domain}`));
-    } catch { return false; }
-  }
-
-  function isBulkUrl(target: string): boolean {
-    try {
-      const u = new URL(target); const host = u.hostname.toLowerCase().replace(/^www\./, '');
-      const parts = u.pathname.split('/').filter(Boolean);
-      if (host === 'instagram.com') return parts.length === 1 && !['accounts','direct','explore','reels','stories'].includes(parts[0]);
-      if (host === 'tiktok.com') return parts.length === 1 && parts[0].startsWith('@');
-      if (host === 'facebook.com') return parts.length === 1 && !['watch','reel','reels','share'].includes(parts[0]);
-      if (host === 'x.com' || host === 'twitter.com') return parts.length === 1 || (parts.length === 2 && ['media','likes'].includes(parts[1]));
-      if (host === 'reddit.com') return (parts[0] === 'r' && (parts.length === 2 || parts.length === 3)) || ((parts[0] === 'u' || parts[0] === 'user') && parts.length >= 2 && parts.length <= 3);
-    } catch {}
-    return false;
-  }
-
-  async function chooseOutputDir(): Promise<string | null> {
-    const settings = getSettings();
-    let outputDir = settings?.download.default_output_dir ?? '';
-    if (!outputDir || settings?.download.always_ask_path) {
-      const selected = await open({ directory: true, title: 'Choose download folder' });
-      if (!selected || Array.isArray(selected)) return null;
-      outputDir = selected;
-    }
-    return outputDir;
-  }
-
-  function socialDownloadMode(targetUrl: string): string | null {
-    if (!isBulkUrl(targetUrl)) return null;
-    return `social:${JSON.stringify({
-      from_date: fromDate || null,
-      to_date: toDate || null,
-      photos, videos, reels, galleries,
-      skip_existing: skipExisting,
-      metadata,
-      folder_template: advanced ? folderTemplate : null,
-    })}`;
-  }
-
-  async function downloadOne(targetUrl: string, outputDir: string): Promise<DownloadStarted> {
-    const detected = await invoke<PlatformInfo>('detect_platform', { url: targetUrl });
-    if (!detected.supported) throw new Error('Unsupported or invalid URL');
-    return await invoke<DownloadStarted>('download_from_url', {
-      url: targetUrl,
-      outputDir,
-      downloadMode: socialDownloadMode(targetUrl),
-      quality: bestQuality ? 'best' : 'default',
-      formatId: null,
-      referer: null,
-      cookieSlug: null,
-      timeRange: null,
-      playlistItems: null,
-      torrentFiles: null,
-      scheduledAt: null,
-      stopAt: null,
-    });
-  }
-
-  async function startDownload() {
-    if (starting) return;
-    const urls = getInputUrls();
-    if (!urls.length) { showToast('error', 'Paste at least one public URL first.'); return; }
-    if (mode !== 'Multiple URLs' && urls.length > 1) { showToast('error', 'Use Multiple URLs mode when pasting more than one URL.'); return; }
-    if (mode !== 'Multiple URLs' && !matchesPlatform(urls[0])) { showToast('error', `The URL does not match the selected ${platform} platform.`); return; }
-    if (fromDate && toDate && fromDate > toDate) { showToast('error', 'The From date must be before the To date.'); return; }
-    if (!photos && !videos && !reels) { showToast('error', 'Select at least one media type.'); return; }
-
-    const outputDir = await chooseOutputDir();
-    if (!outputDir) return;
-    starting = true; completedThisRun = 0; failedThisRun = 0; currentItem = '';
-    try {
-      for (const targetUrl of urls) {
-        currentItem = targetUrl;
-        try { await downloadOne(targetUrl, outputDir); completedThisRun += 1; }
-        catch (error) {
-          failedThisRun += 1;
-          const message = typeof error === 'string' ? error : (error as Error)?.message || 'Download failed';
-          console.warn(`Social download failed for ${targetUrl}: ${message}`);
-          if (!retry) break;
-        }
-      }
-      if (failedThisRun === 0) showToast('success', `${completedThisRun} download${completedThisRun === 1 ? '' : 's'} added to the queue.`);
-      else showToast('error', `${completedThisRun} added, ${failedThisRun} failed. Failed items can be retried from Downloads.`);
-    } finally { currentItem = ''; starting = false; }
-  }
-
-  function queueCounts() {
-    let active = 0, completed = 0, failed = 0;
-    for (const item of downloads.values()) {
-      if (item.status === 'downloading' || item.status === 'pending') active += 1;
-      else if (item.status === 'complete') completed += 1;
-      else if (item.status === 'error' || item.status === 'failed') failed += 1;
-    }
-    return { active, completed, failed };
-  }
-  let counts = $derived(queueCounts());
+  function localDate(daysAgo: number): string { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - daysAgo); const p=(n:number)=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; }
+  function setDatePreset(days: number | null) { if(days===null){fromDate='';toDate='';return;} fromDate=localDate(days);toDate=localDate(0); }
+  function getInputUrls(): string[] { return url.split(/\s+/).map(v=>v.trim()).filter(Boolean); }
+  function matchesPlatform(target: string): boolean { try { const host=new URL(target).hostname.toLowerCase().replace(/^www\./,''); const domains:Record<Platform,string[]>={Instagram:['instagram.com'],Facebook:['facebook.com','fb.watch'],'Twitter / X':['x.com','twitter.com'],Reddit:['reddit.com','redd.it'],TikTok:['tiktok.com']}; return domains[platform].some(d=>host===d||host.endsWith(`.${d}`)); } catch { return false; } }
+  function isBulkUrl(target: string): boolean { try { const u=new URL(target); const host=u.hostname.toLowerCase().replace(/^www\./,''); const parts=u.pathname.split('/').filter(Boolean); if(host==='instagram.com') return parts.length===1&&!['accounts','direct','explore','reels','stories'].includes(parts[0]); if(host==='tiktok.com') return parts.length===1&&parts[0].startsWith('@'); if(host==='facebook.com') return parts.length===1&&!['watch','reel','reels','share'].includes(parts[0]); if(host==='x.com'||host==='twitter.com') return parts.length===1||(parts.length===2&&['media','likes'].includes(parts[1])); if(host==='reddit.com') return (parts[0]==='r'&&(parts.length===2||parts.length===3))||((parts[0]==='u'||parts[0]==='user')&&parts.length>=2&&parts.length<=3); } catch {} return false; }
+  function history(): string[] { if(typeof localStorage==='undefined') return []; try{return JSON.parse(localStorage.getItem(HISTORY_KEY)||'[]');}catch{return [];} }
+  function rememberUrls(urls:string[]){ if(typeof localStorage==='undefined')return; const merged=[...urls.map(normalizeSocialUrl),...history()].filter(Boolean); localStorage.setItem(HISTORY_KEY,JSON.stringify([...new Set(merged)].slice(0,500))); }
+  function removeKnownDuplicates(urls:string[]){ const unique=dedupeSocialUrls(urls); const known=new Set(history()); if(!skipExisting)return{urls:unique.urls,duplicates:unique.duplicates.length}; const fresh=unique.urls.filter(v=>!known.has(normalizeSocialUrl(v))); return{urls:fresh,duplicates:unique.duplicates.length+unique.urls.length-fresh.length}; }
+  async function importTextFile(event:Event){ const input=event.currentTarget as HTMLInputElement; const file=input.files?.[0]; if(!file)return; const text=await file.text(); const incoming=text.split(/\r?\n/).map(v=>v.trim()).filter(v=>/^https?:\/\//i.test(v)); url=[...getInputUrls(),...incoming].join('\n'); importedThisRun+=incoming.length; mode='Multiple URLs'; showToast('success',`${incoming.length} URL${incoming.length===1?'':'s'} imported from TXT.`); input.value=''; }
+  async function chooseOutputDir():Promise<string|null>{ const settings=getSettings(); let outputDir=settings?.download.default_output_dir??''; if(!outputDir||settings?.download.always_ask_path){const selected=await open({directory:true,title:'Choose download folder'});if(!selected||Array.isArray(selected))return null;outputDir=selected;}return outputDir; }
+  function socialDownloadMode(targetUrl:string):string|null{if(!isBulkUrl(targetUrl))return null;return `social:${JSON.stringify({from_date:fromDate||null,to_date:toDate||null,photos,videos,reels,galleries,skip_existing:skipExisting,metadata,folder_template:advanced?folderTemplate:null})}`;}
+  async function downloadOne(targetUrl:string,outputDir:string):Promise<DownloadStarted>{ const detected=await invoke<PlatformInfo>('detect_platform',{url:targetUrl}); if(!detected.supported)throw new Error('Unsupported or invalid URL'); return invoke<DownloadStarted>('download_from_url',{url:targetUrl,outputDir,downloadMode:socialDownloadMode(targetUrl),quality:bestQuality?'best':'default',formatId:null,referer:null,cookieSlug:null,timeRange:null,playlistItems:null,torrentFiles:null,scheduledAt:null,stopAt:null}); }
+  async function startDownload(){ if(starting)return; const raw=getInputUrls(); if(!raw.length){showToast('error','Paste at least one public URL first.');return;} const rangeError=validateSocialDateRange(fromDate,toDate); if(rangeError){showToast('error',rangeError);return;} if(mode!=='Multiple URLs'&&raw.length>1){showToast('error','Use Multiple URLs mode for multiple links.');return;} if(mode!=='Multiple URLs'&&!matchesPlatform(raw[0])){showToast('error',`The URL does not match ${platform}.`);return;} if(!photos&&!videos&&!reels){showToast('error','Select at least one media type.');return;} const prepared=removeKnownDuplicates(raw); duplicateThisRun=prepared.duplicates; if(!prepared.urls.length){showToast('success','All supplied URLs were already processed; nothing new was queued.');return;} const outputDir=await chooseOutputDir();if(!outputDir)return; starting=true;completedThisRun=0;failedThisRun=0;currentItem=''; try{for(const targetUrl of prepared.urls){currentItem=targetUrl;try{await withSocialRetry(()=>downloadOne(targetUrl,outputDir),{enabled:retry,attempts:3,backoffMs:1200});completedThisRun++;rememberUrls([targetUrl]);}catch(error){failedThisRun++;console.warn(`Social download failed for ${targetUrl}:`,error);}} showToast(failedThisRun?'error':'success',`${completedThisRun} added, ${failedThisRun} failed${duplicateThisRun?`, ${duplicateThisRun} duplicate/skipped`:''}.`);}finally{currentItem='';starting=false;} }
+  function queueCounts(){let active=0,completed=0,failed=0;for(const item of downloads.values()){if(item.status==='downloading'||item.status==='pending')active++;else if(item.status==='complete')completed++;else if(item.status==='error'||item.status==='failed')failed++;}return{active,completed,failed};}
+  let counts=$derived(queueCounts());
 </script>
 
 <svelte:head><title>Social Downloader · OmniGet</title></svelte:head>
-
 <div class="social-page">
-  <header class="hero"><div><div class="eyebrow">OMNIGET · SOCIAL</div><h1>Social Downloader</h1><p>Download public posts from Instagram, Facebook, X, Reddit and TikTok using OmniGet's native download engine.</p></div><div class="hero-badge"><span></span> Connected</div></header>
-
+  <header class="hero"><div><div class="eyebrow">OMNIGET · SOCIAL</div><h1>Social Downloader</h1><p>Public Instagram, Facebook, X, Reddit and TikTok downloader with bulk filters, retry, duplicate protection and native queue support.</p></div><div class="hero-badge"><span></span> Public mode</div></header>
   <section class="workspace">
-    <div class="panel source-panel"><div class="panel-head"><div><h2>Source</h2><p>Choose a platform and download mode.</p></div></div>
-      <div class="platforms">{#each platforms as item}<button class:active={platform === item} class="platform" onclick={() => platform = item}><span class="platform-mark">{item === 'Twitter / X' ? 'X' : item[0]}</span><span>{item}</span></button>{/each}</div>
-      <div class="mode-tabs">{#each modes as item}<button class:active={mode === item} onclick={() => mode = item}>{item}</button>{/each}</div>
-      <label class="field-label">{mode === 'Single post' ? 'Post URL' : mode === 'Bulk / profile' ? 'Profile / collection URL' : 'URLs'}</label>
-      <textarea bind:value={url} rows={mode === 'Multiple URLs' ? 5 : 2} placeholder={mode === 'Multiple URLs' ? 'Paste one public URL per line…' : 'https://…'}></textarea>
-      {#if mode === 'Multiple URLs'}<div class="hint">Each URL is sent to OmniGet's native queue one at a time.</div>{/if}
-    </div>
-
-    <div class="panel filters-panel"><div class="panel-head"><div><h2>Filters & content</h2><p>Bulk/profile downloads now pass these filters to gallery-dl.</p></div></div>
-      <div class="date-head"><span>Date range</span><div class="presets"><button onclick={() => setDatePreset(null)}>All time</button><button onclick={() => setDatePreset(7)}>7 days</button><button onclick={() => setDatePreset(30)}>30 days</button></div></div>
-      <div class="date-grid"><label>From<input type="date" bind:value={fromDate}></label><label>To<input type="date" bind:value={toDate}></label></div>
-      <div class="content-grid">
-        <label class="check"><input type="checkbox" bind:checked={photos}><span>Photos</span></label>
-        <label class="check"><input type="checkbox" bind:checked={videos}><span>Videos</span></label>
-        <label class="check"><input type="checkbox" bind:checked={reels}><span>Reels / short video</span></label>
-        <label class="check"><input type="checkbox" bind:checked={galleries}><span>Carousels / galleries</span></label>
-      </div>
-      <div class="filter-note">Date and photo/video filters are enforced for bulk/profile extraction where gallery-dl exposes the required metadata. Carousel filtering remains extractor-dependent.</div>
-    </div>
-
-    <div class="panel options-panel"><div class="panel-head"><div><h2>Download options</h2><p>Reliable defaults for queues.</p></div></div>
-      <label class="switch"><input type="checkbox" bind:checked={bestQuality}><span class="track"></span><span>Best available quality</span></label>
-      <label class="switch"><input type="checkbox" bind:checked={skipExisting}><span class="track"></span><span>Skip existing files</span></label>
-      <label class="switch"><input type="checkbox" bind:checked={resume}><span class="track"></span><span>Resume interrupted downloads</span></label>
-      <label class="switch"><input type="checkbox" bind:checked={retry}><span class="track"></span><span>Retry failed items</span></label>
-      <label class="switch"><input type="checkbox" bind:checked={publicOnly}><span class="track"></span><span>Prefer public / no-login mode</span></label>
-      <button class="advanced-toggle" onclick={() => advanced = !advanced}>{advanced ? 'Hide advanced settings' : 'Show advanced settings'} <span>{advanced ? '⌃' : '⌄'}</span></button>
-      {#if advanced}<div class="advanced"><label>Folder template<input bind:value={folderTemplate}></label><label>Duplicate strategy<select bind:value={duplicateStrategy}><option>URL + content hash</option><option>URL only</option><option>Filename only</option></select></label><label class="check"><input type="checkbox" bind:checked={metadata}><span>Save sidecar JSON metadata</span></label></div>{/if}
-    </div>
+    <div class="panel"><div class="panel-head"><div><h2>Source</h2><p>Select a platform and mode.</p></div></div><div class="platforms">{#each platforms as item}<button class:active={platform===item} class="platform" onclick={()=>platform=item}><b>{item==='Twitter / X'?'X':item[0]}</b>{item}</button>{/each}</div><div class="mode-tabs">{#each modes as item}<button class:active={mode===item} onclick={()=>mode=item}>{item}</button>{/each}</div><label class="label">{mode==='Single post'?'Post URL':mode==='Bulk / profile'?'Profile / collection URL':'URLs'}</label><textarea bind:value={url} rows={mode==='Multiple URLs'?7:3} placeholder={mode==='Multiple URLs'?'One public URL per line…':'https://…'}></textarea><div class="source-actions"><label class="file-button">Import .txt<input type="file" accept=".txt,text/plain" onchange={importTextFile}></label><button onclick={()=>url=''}>Clear</button></div></div>
+    <div class="panel"><div class="panel-head"><div><h2>Filters</h2><p>Bulk/profile options are passed to gallery-dl.</p></div></div><div class="date-head"><span class="label">Date range</span><div><button onclick={()=>setDatePreset(null)}>All</button><button onclick={()=>setDatePreset(7)}>7d</button><button onclick={()=>setDatePreset(30)}>30d</button></div></div><div class="date-grid"><label>From<input type="date" bind:value={fromDate}></label><label>To<input type="date" bind:value={toDate}></label></div><div class="checks"><label><input type="checkbox" bind:checked={photos}> Photos</label><label><input type="checkbox" bind:checked={videos}> Videos</label><label><input type="checkbox" bind:checked={reels}> Reels / short video</label><label><input type="checkbox" bind:checked={galleries}> Carousels / galleries</label></div><p class="hint">Date and photo/video filtering is enforced for bulk/profile extraction where gallery-dl exposes the needed metadata. Carousel-only filtering remains extractor-dependent.</p></div>
+    <div class="panel"><div class="panel-head"><div><h2>Options</h2><p>Safe defaults for repeat downloads.</p></div></div><label class="switch"><input type="checkbox" bind:checked={bestQuality}> Best available quality</label><label class="switch"><input type="checkbox" bind:checked={skipExisting}> Skip existing / duplicate URLs</label><label class="switch"><input type="checkbox" bind:checked={resume}> Resume interrupted downloads</label><label class="switch"><input type="checkbox" bind:checked={retry}> Retry transient failures (up to 3)</label><label class="switch"><input type="checkbox" bind:checked={publicOnly}> Public / no-login mode</label><button class="advanced-toggle" onclick={()=>advanced=!advanced}>{advanced?'Hide advanced':'Show advanced'} <span>{advanced?'⌃':'⌄'}</span></button>{#if advanced}<div class="advanced"><label>Folder template<input bind:value={folderTemplate}></label><label>Duplicate strategy<select bind:value={duplicateStrategy}><option>URL + content hash</option><option>URL only</option><option>Filename only</option></select></label><label><input type="checkbox" bind:checked={metadata}> Sidecar JSON metadata</label></div>{/if}</div>
   </section>
-
-  <section class="action-bar"><div><strong>{platform}</strong><span> · {mode}</span><small>{fromDate || 'Any date'} → {toDate || 'Any date'}</small>{#if currentItem}<small class="current">Downloading: {currentItem}</small>{/if}</div><button class="primary" disabled={starting} onclick={startDownload}>{starting ? 'Adding to queue…' : 'Start download'} <span>→</span></button></section>
-
-  <section class="queue-section"><div class="section-head"><div><div class="eyebrow">QUEUE</div><h2>Download queue</h2></div><div class="queue-stats"><span>{counts.active} active</span><span>{counts.completed} completed</span><span>{counts.failed} failed</span></div></div>
-    {#if completedThisRun || failedThisRun}<div class="run-summary"><strong>Last run:</strong> {completedThisRun} added · {failedThisRun} failed</div>{/if}
-    <div class="empty-queue"><div class="queue-icon">↓</div><h3>{starting ? 'Adding downloads to the native queue…' : 'Your queue is ready'}</h3><p>Downloads are handled by OmniGet's existing native queue, so progress, retries and completion status remain available in the main Downloads screen.</p></div>
-  </section>
-  <div class="notice"><strong>Public content only</strong><span>This workspace does not bypass private accounts, CAPTCHA, DRM, rate limits or other access controls. Bulk/profile behavior depends on what the platform's supported extractor exposes.</span></div>
+  <section class="action"><div><strong>{platform}</strong><span> · {mode}</span><small>{fromDate||'Any date'} → {toDate||'Any date'}{#if importedThisRun} · {importedThisRun} imported{/if}</small>{#if currentItem}<small>Processing: {currentItem}</small>{/if}</div><button class="primary" disabled={starting} onclick={startDownload}>{starting?'Adding…':'Start download'} →</button></section>
+  <section class="queue"><div class="section-head"><div><div class="eyebrow">QUEUE</div><h2>Download queue</h2></div><div class="stats"><span>{counts.active} active</span><span>{counts.completed} completed</span><span>{counts.failed} failed</span></div></div>{#if completedThisRun||failedThisRun||duplicateThisRun}<div class="summary"><b>Last run:</b> {completedThisRun} added · {failedThisRun} failed · {duplicateThisRun} duplicate/skipped</div>{/if}<div class="queue-card"><div class="queue-icon">↓</div><h3>{starting?'Adding downloads to the native queue…':'Ready'}</h3><p>Progress, cancellation and final status continue to use OmniGet's existing native Downloads queue.</p></div></section>
+  <div class="notice"><b>Public content only</b><span>No private-account bypass, CAPTCHA bypass, DRM bypass, paywall bypass or rate-limit evasion is performed.</span></div>
 </div>
-
 <style>
-  .social-page{max-width:1180px;margin:0 auto;padding:34px 30px 60px;color:var(--text);font-family:inherit}.eyebrow{font-size:11px;font-weight:800;letter-spacing:.14em;opacity:.55}.hero{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:26px}.hero h1{font-size:32px;line-height:1.1;margin:7px 0}.hero p{margin:0;max-width:720px;color:var(--text-secondary);font-size:14px}.hero-badge{border:1px solid var(--border);border-radius:999px;padding:8px 12px;font-size:12px;color:var(--text-secondary);white-space:nowrap}.hero-badge span{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:7px}.workspace{display:grid;grid-template-columns:1.15fr 1fr .9fr;gap:14px}.panel{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px;box-shadow:0 1px 2px #00000008}.panel-head{display:flex;justify-content:space-between;margin-bottom:16px}.panel h2{font-size:15px;margin:0 0 4px}.panel p{font-size:12px;color:var(--text-secondary);margin:0}.platforms{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:14px}.platform{display:flex;align-items:center;gap:9px;padding:10px;border:1px solid var(--border);background:transparent;color:var(--text);border-radius:11px;text-align:left;cursor:pointer}.platform.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}.platform-mark{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-size:12px;font-weight:800;background:var(--background);border:1px solid var(--border)}.mode-tabs{display:flex;gap:5px;padding:4px;background:var(--background);border-radius:10px;margin-bottom:14px}.mode-tabs button{flex:1;border:0;background:transparent;color:var(--text-secondary);padding:8px 5px;border-radius:7px;font-size:11px;cursor:pointer}.mode-tabs button.active{background:var(--surface);color:var(--text);box-shadow:0 1px 3px #00000012}.field-label,.date-head>span{display:block;font-size:11px;font-weight:700;margin-bottom:7px}.panel textarea,.panel input,.panel select{width:100%;box-sizing:border-box;background:var(--background);color:var(--text);border:1px solid var(--border);border-radius:9px;padding:9px 10px;outline:none;font:inherit;font-size:12px}.panel textarea:focus,.panel input:focus,.panel select:focus{border-color:var(--accent)}.hint,.filter-note{font-size:10px;color:var(--text-secondary);margin-top:7px;line-height:1.45}.date-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}.presets{display:flex;gap:4px}.presets button{border:0;background:transparent;color:var(--accent);font-size:10px;cursor:pointer}.date-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:17px}.date-grid label,.advanced label{font-size:10px;color:var(--text-secondary)}.date-grid input,.advanced input,.advanced select{margin-top:5px}.content-grid{display:grid;gap:8px}.check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);cursor:pointer}.check input{width:auto;accent-color:var(--accent)}.switch{display:flex;align-items:center;gap:9px;font-size:12px;margin:0 0 13px;cursor:pointer}.switch input{position:absolute;opacity:0}.track{width:30px;height:17px;border-radius:20px;background:var(--border);position:relative;transition:.15s}.track:after{content:'';position:absolute;width:13px;height:13px;border-radius:50%;background:var(--surface);left:2px;top:2px;transition:.15s;box-shadow:0 1px 2px #0002}.switch input:checked + .track{background:var(--accent)}.switch input:checked + .track:after{left:15px}.advanced-toggle{width:100%;display:flex;justify-content:space-between;border:0;border-top:1px solid var(--border);background:transparent;color:var(--text-secondary);padding:13px 0 0;font-size:11px;cursor:pointer}.advanced{display:grid;gap:10px;margin-top:12px}.advanced label{display:block}.action-bar{margin:14px 0 28px;padding:13px 15px;border:1px solid var(--border);border-radius:14px;background:var(--surface);display:flex;align-items:center;justify-content:space-between;gap:16px}.action-bar strong{font-size:12px}.action-bar span{font-size:12px;color:var(--text-secondary)}.action-bar small{display:block;color:var(--text-secondary);font-size:10px;margin-top:3px}.action-bar .current{max-width:620px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.primary{border:0;background:var(--accent);color:white;padding:10px 16px;border-radius:9px;font-weight:700;font-size:12px;cursor:pointer}.primary:disabled{opacity:.55;cursor:wait}.primary span{color:inherit;margin-left:7px}.section-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:12px}.section-head h2{font-size:18px;margin:5px 0 0}.queue-stats{display:flex;gap:12px;font-size:10px;color:var(--text-secondary)}.run-summary{margin-bottom:10px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);font-size:11px;color:var(--text-secondary)}.run-summary strong{color:var(--text)}.empty-queue{border:1px dashed var(--border);border-radius:15px;padding:38px 20px;text-align:center;background:var(--surface)}.queue-icon{margin:auto;width:42px;height:42px;border-radius:12px;background:var(--background);border:1px solid var(--border);display:grid;place-items:center;font-size:22px}.empty-queue h3{font-size:14px;margin:12px 0 5px}.empty-queue p{font-size:11px;color:var(--text-secondary);margin:0 auto;max-width:560px;line-height:1.5}.notice{display:flex;gap:10px;margin-top:14px;padding:12px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--border);font-size:10px;color:var(--text-secondary);line-height:1.5}.notice strong{color:var(--text);white-space:nowrap}@media(max-width:950px){.workspace{grid-template-columns:1fr}.social-page{padding:24px 18px 45px}.hero h1{font-size:28px}}@media(max-width:560px){.platforms{grid-template-columns:1fr}.mode-tabs{flex-direction:column}.action-bar{align-items:stretch;flex-direction:column}.primary{width:100%}.queue-stats{display:none}.notice{flex-direction:column}.hero-badge{display:none}}
+.social-page{max-width:1180px;margin:auto;padding:32px 28px 60px;color:var(--text)}.eyebrow{font-size:10px;font-weight:800;letter-spacing:.14em;opacity:.55}.hero{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:22px}.hero h1{margin:6px 0;font-size:30px}.hero p{margin:0;color:var(--text-secondary);font-size:13px;max-width:760px}.hero-badge{border:1px solid var(--border);border-radius:999px;padding:8px 12px;font-size:11px;color:var(--text-secondary);white-space:nowrap}.hero-badge span{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px}.workspace{display:grid;grid-template-columns:1.15fr 1fr .9fr;gap:12px}.panel{background:var(--surface);border:1px solid var(--border);border-radius:15px;padding:17px}.panel-head{margin-bottom:14px}.panel h2{font-size:15px;margin:0 0 3px}.panel p{font-size:11px;color:var(--text-secondary);margin:0}.platforms{display:grid;grid-template-columns:1fr 1fr;gap:7px}.platform{border:1px solid var(--border);background:transparent;color:var(--text);padding:9px;border-radius:9px;text-align:left;font-size:11px;cursor:pointer}.platform b{display:inline-grid;place-items:center;width:23px;height:23px;margin-right:7px;border-radius:7px;background:var(--background)}.platform.active{border-color:var(--accent)}.mode-tabs{display:flex;gap:4px;background:var(--background);padding:4px;border-radius:9px;margin:12px 0}.mode-tabs button{flex:1;border:0;background:transparent;color:var(--text-secondary);padding:7px 3px;border-radius:6px;font-size:10px}.mode-tabs button.active{background:var(--surface);color:var(--text)}.label{font-size:10px;font-weight:700}.panel textarea,.panel input,.panel select{box-sizing:border-box;width:100%;margin-top:5px;background:var(--background);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px;font:inherit;font-size:11px}.source-actions{display:flex;gap:7px;margin-top:8px}.source-actions button,.file-button,.date-head button{border:1px solid var(--border);background:transparent;color:var(--text-secondary);border-radius:7px;padding:6px 9px;font-size:10px;cursor:pointer}.file-button input{display:none}.date-head{display:flex;justify-content:space-between;align-items:center}.date-head button{border:0;color:var(--accent);padding:3px 5px}.date-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin:9px 0 14px}.date-grid label,.advanced label{font-size:10px;color:var(--text-secondary)}.checks{display:grid;gap:8px;font-size:11px}.checks input,.advanced input{width:auto}.hint{line-height:1.45;margin-top:10px}.switch{display:flex;gap:8px;align-items:center;font-size:11px;margin:0 0 12px}.switch input{width:auto}.advanced-toggle{width:100%;border:0;border-top:1px solid var(--border);background:transparent;color:var(--text-secondary);padding:11px 0 0;text-align:left;font-size:10px;display:flex;justify-content:space-between}.advanced{display:grid;gap:9px;margin-top:10px}.action{display:flex;justify-content:space-between;align-items:center;gap:15px;background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:12px 14px;margin:12px 0 25px}.action strong{font-size:12px}.action span,.action small{color:var(--text-secondary);font-size:10px}.action small{display:block;margin-top:3px;max-width:700px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.primary{border:0;background:var(--accent);color:#fff;border-radius:8px;padding:10px 14px;font-size:11px;font-weight:700;cursor:pointer}.primary:disabled{opacity:.55}.section-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:10px}.section-head h2{font-size:17px;margin:4px 0}.stats{display:flex;gap:10px;color:var(--text-secondary);font-size:9px}.summary{padding:9px 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);font-size:10px;color:var(--text-secondary);margin-bottom:9px}.summary b{color:var(--text)}.queue-card{border:1px dashed var(--border);border-radius:13px;background:var(--surface);padding:34px;text-align:center}.queue-icon{width:38px;height:38px;margin:auto;border:1px solid var(--border);border-radius:10px;display:grid;place-items:center}.queue-card h3{font-size:13px;margin:10px 0 4px}.queue-card p{font-size:10px;color:var(--text-secondary);margin:0}.notice{display:flex;gap:9px;margin-top:12px;padding:11px 13px;border:1px solid var(--border);border-radius:10px;background:var(--surface);font-size:9px;color:var(--text-secondary)}.notice b{color:var(--text);white-space:nowrap}@media(max-width:950px){.workspace{grid-template-columns:1fr}}@media(max-width:600px){.social-page{padding:22px 14px}.hero,.action{align-items:stretch;flex-direction:column}.hero-badge{align-self:flex-start}.platforms{grid-template-columns:1fr}.primary{width:100%}.notice{flex-direction:column}}
 </style>
