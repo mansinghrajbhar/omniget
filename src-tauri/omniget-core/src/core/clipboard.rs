@@ -3,30 +3,41 @@ use std::path::Path;
 const MAX_CLIPBOARD_FILE_SIZE: u64 = 1_073_741_824; // 1 GB
 
 pub async fn copy_file_to_clipboard(path: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() > MAX_CLIPBOARD_FILE_SIZE {
-        tracing::info!(
-            "[clipboard] skipping copy: file too large ({} bytes)",
-            metadata.len()
-        );
+    #[cfg(target_os = "android")]
+    {
+        let _ = path;
+        // Android uses the system share sheet rather than desktop clipboard
+        // file URI formats. Keep this cross-platform API harmless on mobile.
         return Ok(());
     }
 
-    let path_str = path.to_string_lossy().to_string();
-
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "android"))]
     {
-        copy_file_macos(&path_str).await
-    }
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_CLIPBOARD_FILE_SIZE {
+            tracing::info!(
+                "[clipboard] skipping copy: file too large ({} bytes)",
+                metadata.len()
+            );
+            return Ok(());
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        copy_file_linux(&path_str).await
-    }
+        let path_str = path.to_string_lossy().to_string();
 
-    #[cfg(target_os = "windows")]
-    {
-        copy_file_windows(&path_str).await
+        #[cfg(target_os = "macos")]
+        {
+            copy_file_macos(&path_str).await
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            copy_file_linux(&path_str).await
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            copy_file_windows(&path_str).await
+        }
     }
 }
 
@@ -140,7 +151,7 @@ async fn copy_file_linux(path: &str) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if let Ok(true) = wl_result {
-        tracing::info!("[clipboard] copied file to clipboard (wl-copy): {}", path);
+        tracing::info!("[clipboard] copied file URI to clipboard (wl-copy): {}", path);
         return Ok(());
     }
 
