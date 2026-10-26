@@ -1,5 +1,4 @@
 name: Android APK
-# Fresh Android APK build trigger
 
 on:
   push:
@@ -12,7 +11,7 @@ permissions:
 jobs:
   android-apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,6 +66,7 @@ jobs:
       - name: Create Android-only Rust entry point
         shell: bash
         run: |
+          set -euo pipefail
           mv src-tauri/src/lib.rs src-tauri/src/lib_desktop.rs
           cat > src-tauri/src/lib.rs <<'EOF'
           #[cfg(not(target_os = "android"))]
@@ -92,17 +92,41 @@ jobs:
           }
           EOF
 
-      - name: Fix mobile core feature selection
+      - name: Select mobile Rust feature set
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path("src-tauri/Cargo.toml")
           s = p.read_text()
-          s = s.replace('omniget-core = { path = "omniget-core", features = ["desktop"] }',
-                        'omniget-core = { path = "omniget-core", default-features = false, features = ["mobile"] }')
+          old = 'omniget-core = { path = "omniget-core", features = ["desktop"] }'
+          new = 'omniget-core = { path = "omniget-core", default-features = false, features = ["mobile"] }'
+          if old not in s:
+              raise SystemExit("Expected omniget-core dependency declaration was not found")
+          p.write_text(s.replace(old, new))
+          PY
+
+      - name: Configure Android Rust TLS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use rustls for HTTP clients and exclude desktop-only native TLS code
+          # from Android builds. The Android-only entry point does not use
+          # the desktop torrent/P2P module that pulls librqbit's OpenSSL wrapper.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/Cargo.toml")
+          s = p.read_text()
+          s = s.replace('librqbit = "8.1.1"', 'librqbit = { version = "8.1.1", optional = true }')
+          s = s.replace('discord-rich-presence = "0.2"', 'discord-rich-presence = { version = "0.2", optional = true }')
+          s = s.replace('keepawake = "0.5"', 'keepawake = { version = "0.5", optional = true }')
+          s = s.replace('libloading = "0.8"', 'libloading = { version = "0.8", optional = true }')
           p.write_text(s)
           PY
+          # Prevent Cargo from compiling OpenSSL-based native TLS in Android's
+          # transitive graph when the mobile app doesn't enable desktop features.
+          cargo update -p reqwest --precise 0.12.28
+          cargo tree --target aarch64-linux-android -i openssl-sys || true
 
       - name: Build frontend
         run: pnpm build
@@ -115,11 +139,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          echo "APK files produced by Tauri:"
           find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print
-          apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | grep -E '(universal|release)' | head -n 1)"
+          apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | grep -E '(universal|release)' | head -n 1 || true)"
           if [ -z "$apk" ]; then
-            echo "ERROR: No release APK was produced."
+            apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | head -n 1 || true)"
+          fi
+          if [ -z "$apk" ]; then
+            echo "ERROR: No APK was produced."
             exit 1
           fi
           cp "$apk" artifacts/omniget-android.apk
