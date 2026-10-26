@@ -106,26 +106,29 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
-      - name: Configure Android Rust TLS dependencies
+      - name: Select mobile Rust TLS dependencies
         shell: bash
+        working-directory: src-tauri
         run: |
           set -euo pipefail
-          # Use rustls for HTTP clients and exclude desktop-only native TLS code
-          # from Android builds. The Android-only entry point does not use
-          # the desktop torrent/P2P module that pulls librqbit's OpenSSL wrapper.
+          # The Android-only entry point doesn't use desktop torrent/P2P or
+          # dynamic plugin loading. Remove these optional desktop dependencies
+          # from this temporary Android build manifest.
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("src-tauri/Cargo.toml")
+          p = Path("Cargo.toml")
           s = p.read_text()
-          s = s.replace('librqbit = "8.1.1"', 'librqbit = { version = "8.1.1", optional = true }')
-          s = s.replace('discord-rich-presence = "0.2"', 'discord-rich-presence = { version = "0.2", optional = true }')
-          s = s.replace('keepawake = "0.5"', 'keepawake = { version = "0.5", optional = true }')
-          s = s.replace('libloading = "0.8"', 'libloading = { version = "0.8", optional = true }')
+          for old, new in [
+              ('librqbit = "8.1.1"', 'librqbit = { version = "8.1.1", optional = true }'),
+              ('discord-rich-presence = "0.2"', 'discord-rich-presence = { version = "0.2", optional = true }'),
+              ('keepawake = "0.5"', 'keepawake = { version = "0.5", optional = true }'),
+              ('libloading = "0.8"', 'libloading = { version = "0.8", optional = true }'),
+          ]:
+              s = s.replace(old, new)
           p.write_text(s)
           PY
-          # Prevent Cargo from compiling OpenSSL-based native TLS in Android's
-          # transitive graph when the mobile app doesn't enable desktop features.
-          cargo update -p reqwest --precise 0.12.28
+          # The android entry point avoids compiling the desktop Tauri module;
+          # verify whether OpenSSL is still present and show the dependency path.
           cargo tree --target aarch64-linux-android -i openssl-sys || true
 
       - name: Build frontend
