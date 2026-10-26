@@ -10,8 +10,6 @@
     "dialog:default",
     "notification:default",
     "fs:default",
-    "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text",
     "updater:default",
     "process:allow-restart",
     "core:window:allow-set-badge-count",
