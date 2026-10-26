@@ -1,0 +1,118 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.29.3
+          run_install: false
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;35.0.0" "ndk;29.0.13846066"
+          yes | sdkmanager --licenses >/dev/null || true
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.13846066" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Rust Android linker
+        run: cargo install cargo-ndk --locked
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Tauri Android project
+        run: pnpm tauri android init
+
+      - name: Create Android-only Rust entry point
+        shell: bash
+        run: |
+          mv src-tauri/src/lib.rs src-tauri/src/lib_desktop.rs
+          cat > src-tauri/src/lib.rs <<'EOF'
+          #[cfg(not(target_os = "android"))]
+          include!("lib_desktop.rs");
+
+          #[cfg(target_os = "android")]
+          mod mobile;
+
+          #[cfg(target_os = "android")]
+          #[cfg_attr(mobile, tauri::mobile_entry_point)]
+          pub fn run() {
+              tauri::Builder::default()
+                  .plugin(tauri_plugin_dialog::init())
+                  .plugin(tauri_plugin_notification::init())
+                  .plugin(tauri_plugin_fs::init())
+                  .plugin(tauri_plugin_clipboard_manager::init())
+                  .invoke_handler(tauri::generate_handler![
+                      mobile::detect_platform,
+                      mobile::download_from_url,
+                  ])
+                  .run(tauri::generate_context!())
+                  .expect("error while running Android application");
+          }
+          EOF
+
+      - name: Fix mobile core feature selection
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/Cargo.toml")
+          s = p.read_text()
+          s = s.replace('omniget-core = { path = "omniget-core", features = ["desktop"] }',
+                        'omniget-core = { path = "omniget-core", default-features = false, features = ["mobile"] }')
+          p.write_text(s)
+          PY
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build universal Android APK
+        run: pnpm tauri android build --apk
+
+      - name: Locate APK
+        shell: bash
+        run: |
+          find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniget-android-apk
+          path: src-tauri/gen/android/app/build/outputs/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
