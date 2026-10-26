@@ -10,11 +10,6 @@
     "dialog:default",
     "notification:default",
     "fs:default",
-    "updater:default",
-    "process:allow-restart",
-    "core:window:allow-set-badge-count",
-    "core:window:allow-set-progress-bar",
-    "core:window:allow-set-overlay-icon",
-    "autostart:default"
+    "core:window:allow-set-badge-count"
   ]
 }
