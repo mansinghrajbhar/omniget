@@ -106,18 +106,28 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Build universal Android APK
+      - name: Build Android APK
         run: pnpm tauri android build --apk
 
-      - name: Locate APK
+      - name: Prepare APK artifact
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          echo "APK files produced by Tauri:"
           find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print
+          apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | grep -E '(universal|release)' | head -n 1)"
+          if [ -z "$apk" ]; then
+            echo "ERROR: No release APK was produced."
+            exit 1
+          fi
+          cp "$apk" artifacts/omniget-android.apk
+          ls -lh artifacts/omniget-android.apk
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: omniget-android-apk
-          path: src-tauri/gen/android/app/build/outputs/**/*.apk
+          path: artifacts/omniget-android.apk
           if-no-files-found: error
           retention-days: 14
