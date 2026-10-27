@@ -11,7 +11,7 @@ permissions:
 jobs:
   android-apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,6 +94,7 @@ jobs:
       - name: Select mobile Rust feature set
         shell: bash
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           p = Path("src-tauri/Cargo.toml")
@@ -105,7 +106,7 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
-      - name: Select mobile TLS dependencies
+      - name: Select mobile-only dependencies
         shell: bash
         working-directory: src-tauri
         run: |
@@ -115,44 +116,70 @@ jobs:
           p = Path("Cargo.toml")
           s = p.read_text()
           for old, new in [
-              ('tauri-plugin-clipboard-manager = "2"', 'tauri-plugin-clipboard-manager = { version = "2", optional = true }'),
-              ('librqbit = "8.1.1"', 'librqbit = { version = "8.1.1", optional = true }'),
-              ('discord-rich-presence = "0.2"', 'discord-rich-presence = { version = "0.2", optional = true }'),
-              ('keepawake = "0.5"', 'keepawake = { version = "0.5", optional = true }'),
               ('libloading = "0.8"', 'libloading = { version = "0.8", optional = true }'),
+              ('librqbit = "8.1.1"', 'librqbit = { version = "8.1.1", optional = true }'),
+              ('keepawake = "0.5"', 'keepawake = { version = "0.5", optional = true }'),
+              ('discord-rich-presence = "0.2"', 'discord-rich-presence = { version = "0.2", optional = true }'),
           ]:
               s = s.replace(old, new)
           p.write_text(s)
           PY
-          cargo tree --target aarch64-linux-android -i openssl-sys || true
+
+      - name: Configure Android compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle_file="src-tauri/gen/android/app/build.gradle.kts"
+          if [ ! -f "$gradle_file" ]; then
+            echo "ERROR: Tauri Android Gradle file was not generated: $gradle_file"
+            find src-tauri/gen/android -maxdepth 4 -type f -name 'build.gradle*' -print || true
+            exit 1
+          fi
+          python3 - "$gradle_file" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          p = Path(sys.argv[1])
+          s = p.read_text()
+          s, n1 = re.subn(r'(?m)^(\s*minSdk\s*=\s*)\d+\s*$', r'\g<1>24', s)
+          s, n2 = re.subn(r'(?m)^(\s*targetSdk\s*=\s*)\d+\s*$', r'\g<1>35', s)
+          if n1 == 0:
+              print('minSdk line not found; leaving Tauri default')
+          if n2 == 0:
+              print('targetSdk line not found; leaving Tauri default')
+          p.write_text(s)
+          PY
+          grep -nE 'minSdk|targetSdk' "$gradle_file" || true
 
       - name: Build frontend
         run: pnpm build
 
-      - name: Build Android APK
-        run: pnpm tauri android build --apk
+      - name: Build signed Android debug APK
+        run: pnpm tauri android build --debug --apk
 
-      - name: Prepare APK artifact
+      - name: Verify APK package and signature
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print
-          apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | grep -E '(universal|release)' | head -n 1 || true)"
+          apk="$(find src-tauri/gen/android/app/build/outputs -type f -path '*/apk/debug/*.apk' | head -n 1 || true)"
           if [ -z "$apk" ]; then
-            apk="$(find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' | head -n 1 || true)"
-          fi
-          if [ -z "$apk" ]; then
-            echo "ERROR: No APK was produced."
+            echo "ERROR: Signed debug APK was not produced."
+            find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print || true
             exit 1
           fi
-          cp "$apk" artifacts/omniget-android.apk
-          ls -lh artifacts/omniget-android.apk
+          echo "APK=$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | tee /tmp/omniget-badging.txt
+          grep -q "package: name='wtf.tonho.omniget'" /tmp/omniget-badging.txt
+          grep -q "sdkVersion:'24'" /tmp/omniget-badging.txt
+          mkdir -p artifacts
+          cp "$apk" artifacts/omniget-android-debug.apk
+          ls -lh artifacts/omniget-android-debug.apk
 
-      - name: Upload APK artifact
+      - name: Upload verified APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: omniget-android-apk
-          path: artifacts/omniget-android.apk
+          name: omniget-android-apk-installable
+          path: artifacts/omniget-android-debug.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
