@@ -135,10 +135,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          apk="$(find src-tauri/gen/android/app/build/outputs -type f -path '*/apk/debug/*.apk' | head -n 1 || true)"
+          outputs="src-tauri/gen/android/app/build/outputs"
+          apk="$(find "$outputs" -type f -name '*.apk' -path '*/debug/*' | grep -E '/(arm64-v8a|universal)/' | head -n 1 || true)"
+          if [ -z "$apk" ]; then
+            apk="$(find "$outputs" -type f -name '*.apk' -path '*/debug/*' | head -n 1 || true)"
+          fi
           if [ -z "$apk" ]; then
             echo "ERROR: Signed debug APK was not produced."
-            find src-tauri/gen/android/app/build/outputs -type f -name '*.apk' -print || true
+            find "$outputs" -type f -name '*.apk' -print || true
             exit 1
           fi
           echo "APK=$apk"
