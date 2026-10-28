@@ -131,6 +131,7 @@ jobs:
       - name: Build signed Android debug APK
         run: pnpm tauri android build --debug --apk
 
+      # Build #15: locate and verify the actual Tauri Android debug APK.
       - name: Verify APK package and signature
         shell: bash
         run: |
