@@ -125,32 +125,6 @@ jobs:
           p.write_text(s)
           PY
 
-      - name: Configure Android compatibility
-        shell: bash
-        run: |
-          set -euo pipefail
-          gradle_file="src-tauri/gen/android/app/build.gradle.kts"
-          if [ ! -f "$gradle_file" ]; then
-            echo "ERROR: Tauri Android Gradle file was not generated: $gradle_file"
-            find src-tauri/gen/android -maxdepth 4 -type f -name 'build.gradle*' -print || true
-            exit 1
-          fi
-          python3 - "$gradle_file" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-          p = Path(sys.argv[1])
-          s = p.read_text()
-          s, n1 = re.subn(r'(?m)^(\s*minSdk\s*=\s*)\d+\s*$', r'\g<1>24', s)
-          s, n2 = re.subn(r'(?m)^(\s*targetSdk\s*=\s*)\d+\s*$', r'\g<1>35', s)
-          if n1 == 0:
-              print('minSdk line not found; leaving Tauri default')
-          if n2 == 0:
-              print('targetSdk line not found; leaving Tauri default')
-          p.write_text(s)
-          PY
-          grep -nE 'minSdk|targetSdk' "$gradle_file" || true
-
       - name: Build frontend
         run: pnpm build
 
@@ -171,7 +145,6 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | tee /tmp/omniget-badging.txt
           grep -q "package: name='wtf.tonho.omniget'" /tmp/omniget-badging.txt
-          grep -q "sdkVersion:'24'" /tmp/omniget-badging.txt
           mkdir -p artifacts
           cp "$apk" artifacts/omniget-android-debug.apk
           ls -lh artifacts/omniget-android-debug.apk
