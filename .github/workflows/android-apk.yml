@@ -141,12 +141,16 @@ jobs:
           from pathlib import Path
           p = Path("src-tauri/gen/android/app/build.gradle.kts")
           s = p.read_text()
-          dep = 'implementation("dev.ffmpegkit-maintained:yt-dlp-android:2.0.2")'
-          if dep not in s:
-              marker = "dependencies {"
-              if marker not in s:
-                  raise SystemExit("dependencies block not found in Android Gradle file")
-              s = s.replace(marker, marker + "\n    " + dep, 1)
+          deps = [
+              'implementation("dev.ffmpegkit-maintained:yt-dlp-android:2.0.2")',
+              'implementation("dev.ffmpegkit-maintained:yt-dlp-android-compat:2.0.2")',
+          ]
+          marker = "dependencies {"
+          if marker not in s:
+              raise SystemExit("dependencies block not found in Android Gradle file")
+          insert = "\n".join("    " + d for d in deps if d not in s)
+          if insert:
+              s = s.replace(marker, marker + "\n" + insert, 1)
           p.write_text(s)
 
           m = Path("src-tauri/gen/android/app/src/main/AndroidManifest.xml")
@@ -154,8 +158,11 @@ jobs:
           if 'android:extractNativeLibs="true"' not in ms:
               ms = ms.replace('<application ', '<application android:extractNativeLibs="true" ', 1)
           if 'android.permission.INTERNET' not in ms:
-              ms = ms.replace('<manifest ', '<manifest ', 1)
-              ms = ms.replace('>\n', '>\n    <uses-permission android:name="android.permission.INTERNET" />\n', 1)
+              marker = '<manifest'
+              idx = ms.find('>\n', ms.find(marker))
+              if idx == -1:
+                  raise SystemExit("manifest root tag not found")
+              ms = ms[:idx+2] + '    <uses-permission android:name="android.permission.INTERNET" />\n' + ms[idx+2:]
           m.write_text(ms)
           PY
 
@@ -297,7 +304,7 @@ jobs:
                           activity.contentResolver.delete(uri, null, null)
                       }
                   } else {
-                      val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS + "/OmniGet")
+                      val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "OmniGet")
                       dir.mkdirs()
                       val target = File(dir, source.name)
                       FileInputStream(source).use { input -> FileOutputStream(target).use { output -> input.copyTo(output) } }
