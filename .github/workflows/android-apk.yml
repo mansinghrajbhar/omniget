@@ -11,7 +11,7 @@ permissions:
 jobs:
   android-apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,13 +125,236 @@ jobs:
           p.write_text(s)
           PY
 
+      - name: Add Android yt-dlp runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="src-tauri/gen/android/app"
+          GRADLE="$APP_DIR/build.gradle.kts"
+          MANIFEST="$APP_DIR/src/main/AndroidManifest.xml"
+          if [ ! -f "$GRADLE" ]; then
+            echo "ERROR: Android app Gradle file not found: $GRADLE"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/gen/android/app/build.gradle.kts")
+          s = p.read_text()
+          dep = 'implementation("dev.ffmpegkit-maintained:yt-dlp-android:2.0.2")'
+          if dep not in s:
+              marker = "dependencies {"
+              if marker not in s:
+                  raise SystemExit("dependencies block not found in Android Gradle file")
+              s = s.replace(marker, marker + "\n    " + dep, 1)
+          p.write_text(s)
+
+          m = Path("src-tauri/gen/android/app/src/main/AndroidManifest.xml")
+          ms = m.read_text()
+          if 'android:extractNativeLibs="true"' not in ms:
+              ms = ms.replace('<application ', '<application android:extractNativeLibs="true" ', 1)
+          if 'android.permission.INTERNET' not in ms:
+              ms = ms.replace('<manifest ', '<manifest ', 1)
+              ms = ms.replace('>\n', '>\n    <uses-permission android:name="android.permission.INTERNET" />\n', 1)
+          m.write_text(ms)
+          PY
+
+          PKG=$(grep -R -m1 '^package ' "$APP_DIR/src/main/java" | sed 's/^package //' | tr -d '\r' | xargs)
+          if [ -z "$PKG" ]; then
+            echo "ERROR: Could not determine Android package"
+            exit 1
+          fi
+          PKG_PATH="${PKG//./\/}"
+          JAVA_DIR="$APP_DIR/src/main/java/$PKG_PATH"
+          mkdir -p "$JAVA_DIR"
+
+          cat > "$JAVA_DIR/OmniYtDlpBridge.kt" <<'EOF'
+          package __PACKAGE__
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLException
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.util.concurrent.Executors
+
+          class OmniYtDlpBridge(
+              private val activity: Activity,
+              private val webView: WebView,
+          ) {
+              private val executor = Executors.newCachedThreadPool()
+              @Volatile private var ready = false
+
+              init {
+                  try {
+                      YoutubeDL.getInstance().init(activity)
+                      ready = true
+                  } catch (_: YoutubeDLException) {
+                      ready = false
+                  }
+              }
+
+              @JavascriptInterface
+              fun isReady(): Boolean = ready
+
+              @JavascriptInterface
+              fun download(url: String, mode: String, quality: String): String {
+                  if (!ready) return "error:yt-dlp runtime initialization failed"
+                  if (url.isBlank()) return "error:empty url"
+
+                  executor.execute {
+                      val root = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                          ?: activity.filesDir
+                      val outDir = File(root, "OmniGet")
+                      outDir.mkdirs()
+                      val before = outDir.listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
+                      val template = File(outDir, "%(title)s.%(ext)s").absolutePath
+
+                      try {
+                          val request = YoutubeDLRequest(url)
+                          request.addOption("-o", template)
+                          request.addOption("--no-mtime")
+                          request.addOption("--newline")
+                          request.addOption("--no-playlist")
+
+                          if (mode == "audio") {
+                              request.addOption("-f", "bestaudio/best")
+                          } else {
+                              val q = if (quality.isBlank() || quality == "best") "1080" else quality
+                              request.addOption("-f", "best[height<=$q]/best")
+                          }
+
+                          YoutubeDL.getInstance().execute(request) { progress, eta ->
+                              emitProgress(progress, eta)
+                          }
+
+                          val files = outDir.listFiles()?.filter {
+                              it.isFile && !before.contains(it.absolutePath)
+                          } ?: emptyList()
+                          files.forEach { publishToDownloads(it) }
+                          emitFinished(files.firstOrNull()?.name ?: "")
+                      } catch (t: Throwable) {
+                          emitError(t.message ?: t.javaClass.simpleName)
+                      }
+                  }
+                  return "started"
+              }
+
+              private fun emitProgress(progress: Float, eta: Long) {
+                  val js = "window.__omnigetAndroidProgress && window.__omnigetAndroidProgress(${progress.toInt()}, ${eta});"
+                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
+              }
+
+              private fun emitFinished(name: String) {
+                  val safe = name.replace("\\", "\\\\").replace("'", "\\'")
+                  val js = "window.__omnigetAndroidFinished && window.__omnigetAndroidFinished('$safe');"
+                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
+              }
+
+              private fun emitError(message: String) {
+                  val safe = message.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+                  val js = "window.__omnigetAndroidError && window.__omnigetAndroidError('$safe');"
+                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
+              }
+
+              private fun publishToDownloads(source: File) {
+                  if (!source.exists()) return
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val mime = when (source.extension.lowercase()) {
+                          "mp4" -> "video/mp4"
+                          "webm" -> "video/webm"
+                          "mkv" -> "video/x-matroska"
+                          "mp3" -> "audio/mpeg"
+                          "m4a" -> "audio/mp4"
+                          "opus" -> "audio/ogg"
+                          else -> "application/octet-stream"
+                      }
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, source.name)
+                          put(MediaStore.Downloads.MIME_TYPE, mime)
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/OmniGet")
+                          put(MediaStore.Downloads.IS_PENDING, 1)
+                      }
+                      val uri = activity.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                          ?: return
+                      try {
+                          activity.contentResolver.openOutputStream(uri)?.use { output ->
+                              FileInputStream(source).use { input -> input.copyTo(output) }
+                          }
+                          values.clear()
+                          values.put(MediaStore.Downloads.IS_PENDING, 0)
+                          activity.contentResolver.update(uri, values, null, null)
+                          source.delete()
+                      } catch (_: Throwable) {
+                          activity.contentResolver.delete(uri, null, null)
+                      }
+                  } else {
+                      val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS + "/OmniGet")
+                      dir.mkdirs()
+                      val target = File(dir, source.name)
+                      FileInputStream(source).use { input -> FileOutputStream(target).use { output -> input.copyTo(output) } }
+                      source.delete()
+                  }
+              }
+          }
+          EOF
+          sed -i "s/__PACKAGE__/$PKG/g" "$JAVA_DIR/OmniYtDlpBridge.kt"
+
+          MAIN="$JAVA_DIR/MainActivity.kt"
+          if [ ! -f "$MAIN" ]; then
+            echo "ERROR: MainActivity.kt not found at $MAIN"
+            exit 1
+          fi
+          cat > "$MAIN" <<EOF
+          package $PKG
+
+          import android.webkit.WebView
+
+          class MainActivity : TauriActivity() {
+              override fun onWebViewCreate(webView: WebView) {
+                  super.onWebViewCreate(webView)
+                  webView.addJavascriptInterface(OmniYtDlpBridge(this, webView), "omnigetYtDlp")
+              }
+          }
+          EOF
+
+      - name: Mark Android yt-dlp as embedded
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/src/commands/dependencies.rs")
+          s = p.read_text()
+          old = '''    let (ytdlp_version, ffmpeg_version) = tokio::join!(\n        dependencies::check_version("yt-dlp"),\n        dependencies::check_version("ffmpeg"),\n    );'''
+          new = '''    #[cfg(target_os = "android")]\n    let ytdlp_version = Some("embedded-android".to_string());\n    #[cfg(not(target_os = "android"))]\n    let ytdlp_version = dependencies::check_version("yt-dlp").await;\n\n    let ffmpeg_version = dependencies::check_version("ffmpeg").await;'''
+          if old not in s:
+              raise SystemExit("check_dependencies block not found")
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path("src/routes/+page.svelte")
+          s = p.read_text()
+          needle = '''    const platform = info.platform;\n    omniState = { kind: "preparing", platform };'''
+          replacement = '''    const platform = info.platform;\n\n    const androidYtDlp = (window as any).omnigetYtDlp;\n    if (androidYtDlp?.isReady?.() && platform !== "p2p") {\n      const currentUrlForAndroid = url.trim();\n      omniState = { kind: "preparing", platform };\n      url = "";\n      const result = androidYtDlp.download(\n        currentUrlForAndroid,\n        downloadMode,\n        selectedQuality,\n      );\n      if (typeof result === "string" && result.startsWith("error:")) {\n        omniState = {\n          kind: "error",\n          message: result.slice(6),\n          originalUrl: currentUrlForAndroid,\n          platform,\n        };\n      } else {\n        showToast("info", "Android download started");\n        omniState = { kind: "idle" };\n      }\n      return;\n    }\n\n    omniState = { kind: "preparing", platform };'''
+          if needle not in s:
+              raise SystemExit("download action insertion point not found")
+          p.write_text(s.replace(needle, replacement, 1))
+          PY
+
       - name: Build frontend
         run: pnpm build
 
       - name: Build signed Android debug APK
         run: pnpm tauri android build --debug --apk
 
-      # Build #15: locate and verify the actual Tauri Android debug APK.
       - name: Verify APK package and signature
         shell: bash
         run: |
@@ -154,7 +377,7 @@ jobs:
           cp "$apk" artifacts/omniget-android-debug.apk
           ls -lh artifacts/omniget-android-debug.apk
 
-      - name: Upload verified APK artifact
+      - name: Upload installable APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: omniget-android-apk-installable
