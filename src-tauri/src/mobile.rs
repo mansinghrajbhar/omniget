@@ -41,7 +41,7 @@ pub async fn detect_platform(url: String) -> Result<MobilePlatformInfo, String> 
     Ok(match platform {
         Some(platform) => MobilePlatformInfo {
             platform: platform.to_string(),
-            supported: platform_downloader(&platform).is_some(),
+            supported: true,
             content_id: None,
             content_type: None,
         },
