@@ -1,0 +1,82 @@
+name: Fix Android Build Integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch Android yt-dlp workflow and mobile routing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workflow=".github/workflows/android-apk.yml"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/android-apk.yml')
+          s = p.read_text()
+
+          # Build 16/17 failed before Gradle because recursive grep included the
+          # Java filename in PKG. Use grep -h so PKG is only the package name.
+          s = s.replace(
+              'PKG=$(grep -R -m1 \'^package \' "$APP_DIR/src/main/java" | sed \'s/^package //\' | tr -d \'\\r\' | xargs)',
+              'PKG=$(grep -Rhm1 \'^package \' "$APP_DIR/src/main/java" | sed \'s/^package //\' | tr -d \'\\r\' | xargs)'
+          )
+
+          # yt-dlp Android 2.x exposes the old YoutubeDL API through the compat
+          # migration package, not the old yausername package.
+          s = s.replace(
+              'import com.yausername.youtubedl_android.YoutubeDL',
+              'import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDL'
+          )
+          s = s.replace(
+              'import com.yausername.youtubedl_android.YoutubeDLException',
+              'import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDLException'
+          )
+          s = s.replace(
+              'import com.yausername.youtubedl_android.YoutubeDLRequest',
+              'import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDLRequest'
+          )
+
+          p.write_text(s)
+          PY
+
+          # On Android, route all recognized HTTP platforms to the embedded
+          # yt-dlp bridge. The existing native Rust downloader only covers a
+          # subset of platforms and would otherwise reject YouTube and others.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src-tauri/src/mobile.rs')
+          s = p.read_text()
+          old = 'supported: platform_downloader(&platform).is_some(),'
+          new = 'supported: true,'
+          if old in s:
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+          git diff -- .github/workflows/android-apk.yml src-tauri/src/mobile.rs
+
+      - name: Commit Android build fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/android-apk.yml src-tauri/src/mobile.rs
+          if git diff --cached --quiet; then
+            echo "No Android build patch needed."
+            exit 0
+          fi
+          git commit -m "fix(android): repair yt-dlp bridge build"
+          git push
