@@ -158,15 +158,14 @@ jobs:
           if 'android:extractNativeLibs="true"' not in ms:
               ms = ms.replace('<application ', '<application android:extractNativeLibs="true" ', 1)
           if 'android.permission.INTERNET' not in ms:
-              marker = '<manifest'
-              idx = ms.find('>\n', ms.find(marker))
+              idx = ms.find('>\n', ms.find('<manifest'))
               if idx == -1:
                   raise SystemExit("manifest root tag not found")
               ms = ms[:idx+2] + '    <uses-permission android:name="android.permission.INTERNET" />\n' + ms[idx+2:]
           m.write_text(ms)
           PY
 
-          PKG=$(grep -R -m1 '^package ' "$APP_DIR/src/main/java" | sed 's/^package //' | tr -d '\r' | xargs)
+          PKG=$(grep -Rhm1 '^package ' "$APP_DIR/src/main/java" | sed 's/^package //' | tr -d '\r' | xargs)
           if [ -z "$PKG" ]; then
             echo "ERROR: Could not determine Android package"
             exit 1
@@ -185,9 +184,9 @@ jobs:
           import android.provider.MediaStore
           import android.webkit.JavascriptInterface
           import android.webkit.WebView
-          import com.yausername.youtubedl_android.YoutubeDL
-          import com.yausername.youtubedl_android.YoutubeDLException
-          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDL
+          import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDLException
+          import dev.ffmpegkit_maintained.ytdlp.compat.YoutubeDLRequest
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
@@ -216,60 +215,39 @@ jobs:
               fun download(url: String, mode: String, quality: String): String {
                   if (!ready) return "error:yt-dlp runtime initialization failed"
                   if (url.isBlank()) return "error:empty url"
-
                   executor.execute {
-                      val root = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                          ?: activity.filesDir
+                      val root = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: activity.filesDir
                       val outDir = File(root, "OmniGet")
                       outDir.mkdirs()
                       val before = outDir.listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
                       val template = File(outDir, "%(title)s.%(ext)s").absolutePath
-
                       try {
                           val request = YoutubeDLRequest(url)
                           request.addOption("-o", template)
                           request.addOption("--no-mtime")
                           request.addOption("--newline")
                           request.addOption("--no-playlist")
-
                           if (mode == "audio") {
                               request.addOption("-f", "bestaudio/best")
                           } else {
                               val q = if (quality.isBlank() || quality == "best") "1080" else quality
                               request.addOption("-f", "best[height<=$q]/best")
                           }
-
                           YoutubeDL.getInstance().execute(request) { progress, eta ->
-                              emitProgress(progress, eta)
+                              val js = "window.__omnigetAndroidProgress && window.__omnigetAndroidProgress(${progress.toInt()}, ${eta});"
+                              activity.runOnUiThread { webView.evaluateJavascript(js, null) }
                           }
-
-                          val files = outDir.listFiles()?.filter {
-                              it.isFile && !before.contains(it.absolutePath)
-                          } ?: emptyList()
+                          val files = outDir.listFiles()?.filter { it.isFile && !before.contains(it.absolutePath) } ?: emptyList()
                           files.forEach { publishToDownloads(it) }
-                          emitFinished(files.firstOrNull()?.name ?: "")
+                          val name = files.firstOrNull()?.name ?: ""
+                          val safe = name.replace("\\", "\\\\").replace("'", "\\'")
+                          activity.runOnUiThread { webView.evaluateJavascript("window.__omnigetAndroidFinished && window.__omnigetAndroidFinished('$safe');", null) }
                       } catch (t: Throwable) {
-                          emitError(t.message ?: t.javaClass.simpleName)
+                          val safe = (t.message ?: t.javaClass.simpleName).replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+                          activity.runOnUiThread { webView.evaluateJavascript("window.__omnigetAndroidError && window.__omnigetAndroidError('$safe');", null) }
                       }
                   }
                   return "started"
-              }
-
-              private fun emitProgress(progress: Float, eta: Long) {
-                  val js = "window.__omnigetAndroidProgress && window.__omnigetAndroidProgress(${progress.toInt()}, ${eta});"
-                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
-              }
-
-              private fun emitFinished(name: String) {
-                  val safe = name.replace("\\", "\\\\").replace("'", "\\'")
-                  val js = "window.__omnigetAndroidFinished && window.__omnigetAndroidFinished('$safe');"
-                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
-              }
-
-              private fun emitError(message: String) {
-                  val safe = message.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
-                  val js = "window.__omnigetAndroidError && window.__omnigetAndroidError('$safe');"
-                  activity.runOnUiThread { webView.evaluateJavascript(js, null) }
               }
 
               private fun publishToDownloads(source: File) {
@@ -290,12 +268,9 @@ jobs:
                           put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/OmniGet")
                           put(MediaStore.Downloads.IS_PENDING, 1)
                       }
-                      val uri = activity.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                          ?: return
+                      val uri = activity.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
                       try {
-                          activity.contentResolver.openOutputStream(uri)?.use { output ->
-                              FileInputStream(source).use { input -> input.copyTo(output) }
-                          }
+                          activity.contentResolver.openOutputStream(uri)?.use { output -> FileInputStream(source).use { input -> input.copyTo(output) } }
                           values.clear()
                           values.put(MediaStore.Downloads.IS_PENDING, 0)
                           activity.contentResolver.update(uri, values, null, null)
@@ -333,24 +308,56 @@ jobs:
           }
           EOF
 
-      - name: Mark Android yt-dlp as embedded
+      - name: Mark Android yt-dlp as embedded and route Android downloads
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path("src-tauri/src/commands/dependencies.rs")
           s = p.read_text()
-          old = '''    let (ytdlp_version, ffmpeg_version) = tokio::join!(\n        dependencies::check_version("yt-dlp"),\n        dependencies::check_version("ffmpeg"),\n    );'''
-          new = '''    #[cfg(target_os = "android")]\n    let ytdlp_version = Some("embedded-android".to_string());\n    #[cfg(not(target_os = "android"))]\n    let ytdlp_version = dependencies::check_version("yt-dlp").await;\n\n    let ffmpeg_version = dependencies::check_version("ffmpeg").await;'''
+          old = '''    let (ytdlp_version, ffmpeg_version) = tokio::join!(
+        dependencies::check_version("yt-dlp"),
+        dependencies::check_version("ffmpeg"),
+    );'''
+          new = '''    #[cfg(target_os = "android")]
+    let ytdlp_version = Some("embedded-android".to_string());
+    #[cfg(not(target_os = "android"))]
+    let ytdlp_version = dependencies::check_version("yt-dlp").await;
+
+    let ffmpeg_version = dependencies::check_version("ffmpeg").await;'''
           if old not in s:
               raise SystemExit("check_dependencies block not found")
           p.write_text(s.replace(old, new, 1))
 
+          p = Path("src-tauri/src/mobile.rs")
+          s = p.read_text()
+          s = s.replace('supported: platform_downloader(&platform).is_some(),', 'supported: true,', 1)
+          p.write_text(s)
+
           p = Path("src/routes/+page.svelte")
           s = p.read_text()
-          needle = '''    const platform = info.platform;\n    omniState = { kind: "preparing", platform };'''
-          replacement = '''    const platform = info.platform;\n\n    const androidYtDlp = (window as any).omnigetYtDlp;\n    if (androidYtDlp?.isReady?.() && platform !== "p2p") {\n      const currentUrlForAndroid = url.trim();\n      omniState = { kind: "preparing", platform };\n      url = "";\n      const result = androidYtDlp.download(\n        currentUrlForAndroid,\n        downloadMode,\n        selectedQuality,\n      );\n      if (typeof result === "string" && result.startsWith("error:")) {\n        omniState = {\n          kind: "error",\n          message: result.slice(6),\n          originalUrl: currentUrlForAndroid,\n          platform,\n        };\n      } else {\n        showToast("info", "Android download started");\n        omniState = { kind: "idle" };\n      }\n      return;\n    }\n\n    omniState = { kind: "preparing", platform };'''
+          needle = '''    const platform = info.platform;
+    omniState = { kind: "preparing", platform };'''
+          replacement = '''    const platform = info.platform;
+
+    const androidYtDlp = (window as any).omnigetYtDlp;
+    if (androidYtDlp?.isReady?.() && platform !== "p2p") {
+      const currentUrlForAndroid = url.trim();
+      omniState = { kind: "preparing", platform };
+      url = "";
+      const result = androidYtDlp.download(currentUrlForAndroid, downloadMode, selectedQuality);
+      if (typeof result === "string" && result.startsWith("error:")) {
+        omniState = { kind: "error", message: result.slice(6), originalUrl: currentUrlForAndroid, platform };
+      } else {
+        showToast("info", "Android download started");
+        omniState = { kind: "idle" };
+      }
+      return;
+    }
+
+    omniState = { kind: "preparing", platform };'''
           if needle not in s:
               raise SystemExit("download action insertion point not found")
           p.write_text(s.replace(needle, replacement, 1))
